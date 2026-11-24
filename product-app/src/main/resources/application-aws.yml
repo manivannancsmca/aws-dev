@@ -1,0 +1,20 @@
+# ---------------------------------------------------------------------------
+# "aws" profile: used by the ECS Fargate task.
+# Activated with SPRING_PROFILES_ACTIVE=aws (set in the ECS task definition)
+# ---------------------------------------------------------------------------
+server:
+  # The app sits behind an Application Load Balancer. Trust X-Forwarded-* headers
+  # so generated URLs (Location header, Swagger) use the public scheme/host.
+  forward-headers-strategy: framework
+
+management:
+  endpoint:
+    health:
+      # Only expose {"status":"UP"} publicly; details stay in CloudWatch logs
+      show-details: never
+
+logging:
+  structured:
+    format:
+      # Write logs as JSON (Elastic Common Schema). CloudWatch Logs Insights parses JSON fields automatically.
+      console: ecs

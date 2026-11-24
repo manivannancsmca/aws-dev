@@ -1,0 +1,11 @@
+# Keep the Docker build context small and avoid leaking secrets into the image
+target/
+.env
+.env.*
+!.env.example
+.git/
+.idea/
+.vscode/
+*.iml
+*.md
+docker-compose.yml

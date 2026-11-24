@@ -1,0 +1,67 @@
+# ---------------------------------------------------------------------------
+# Common configuration shared by ALL environments.
+# Environment-specific values come from environment variables (${VAR}) so the
+# same Docker image runs locally (Docker Compose) and on AWS (ECS Fargate).
+# Profile-specific overrides live in application-local.yml / application-aws.yml.
+# ---------------------------------------------------------------------------
+spring:
+  application:
+    name: product-app
+
+  datasource:
+    # DB_HOST  -> "mysql" in Docker Compose, the RDS endpoint on AWS
+    # DB_USERNAME / DB_PASSWORD have NO defaults on purpose: the app refuses to start without them
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:productdb}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+
+  jpa:
+    hibernate:
+      # "validate" = Hibernate checks that the entities match the tables created by Flyway.
+      # It NEVER creates or alters tables. Schema changes are done only through Flyway migrations.
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  jackson:
+    # Leave out null fields in JSON responses (e.g. "fieldErrors" on non-validation errors)
+    default-property-inclusion: non_null
+
+server:
+  port: 8080
+  # Finish in-flight requests before shutting down (important for ECS rolling deployments)
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      # Adds /actuator/health/liveness and /actuator/health/readiness
+      probes:
+        enabled: true
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+logging:
+  level:
+    root: INFO
+    com.example.productapp: INFO

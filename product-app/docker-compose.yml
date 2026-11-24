@@ -1,0 +1,66 @@
+# =============================================================================
+# Local development stack: MySQL 8.0 + product-app.
+# Values like ${MYSQL_PASSWORD} are read from the .env file next to this file.
+#   docker compose up -d --build     start (builds the app image)
+#   docker compose logs -f app       follow application logs
+#   docker compose down              stop (keeps the database volume)
+#   docker compose down -v           stop AND delete the database volume
+# =============================================================================
+services:
+
+  mysql:
+    # MySQL 8.0 (last 8.0 release). Note: a data volume created by a NEWER MySQL (e.g. 8.4)
+    # cannot be opened by 8.0. After switching down, run "docker compose down -v" once.
+    image: mysql:8.0.46
+    container_name: product-mysql
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-productdb}
+      MYSQL_USER: ${MYSQL_USER:-product_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in the .env file}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in the .env file}
+    ports:
+      # Host port is configurable because a local MySQL often already uses 3306
+      - "${MYSQL_HOST_PORT:-3307}:3306"
+    volumes:
+      # Named volume: data survives "docker compose down" and container rebuilds
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # -h 127.0.0.1 forces TCP: during first-time initialisation MySQL briefly runs a
+      # socket-only temporary server, and we must NOT report healthy at that point.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: product-app:local
+    container_name: product-app
+    depends_on:
+      mysql:
+        # Compose waits until the MySQL healthcheck passes before starting the app
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      # "mysql" is the Compose service name; Docker's internal DNS resolves it
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${MYSQL_DATABASE:-productdb}
+      DB_USERNAME: ${MYSQL_USER:-product_user}
+      DB_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in the .env file}
+    ports:
+      - "${APP_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  mysql_data:

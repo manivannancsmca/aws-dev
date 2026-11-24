@@ -1,0 +1,528 @@
+// =============================================================================
+// product-app: create the AWS infrastructure ONE STEP AT A TIME with Terraform.
+//
+// Every build runs exactly ONE step (parameter STEP):
+//   ACTION = plan   -> Terraform shows what it WOULD create. Nothing changes in AWS.
+//   ACTION = apply  -> plan, PAUSE until someone clicks "Yes, apply", then create.
+//
+// Run the steps in order (00, 01, 02, ...). After each apply, look at the new
+// resources in the AWS console (region Mumbai, ap-south-1) before starting the next.
+// Step-by-step guide: docs/11-jenkins-terraform-step-by-step.md
+//
+// Code quality (docs/13): STEP = code-quality runs the tests with JaCoCo coverage and
+// the SonarQube analysis + Quality Gate, without touching AWS. Step 06 runs the same
+// two stages BEFORE it builds the image, so code that fails them never reaches ECR.
+//
+// Tools: the Jenkins container only has the Docker CLI. Terraform, the AWS CLI and
+// Maven run in their official Docker images (versions pinned below and in the agent
+// lines), so nothing has to be installed in Jenkins.
+// =============================================================================
+
+// Which Terraform resources each step creates. Jenkins passes them to Terraform as
+// "-target=<address>". Terraform also creates anything a target depends on, so the
+// ORDER matters: when step N runs, everything it needs already exists from earlier steps.
+def STEP_TARGETS = [
+    '02-network'        : ['aws_vpc.main', 'aws_internet_gateway.main',
+                           'aws_subnet.public', 'aws_subnet.private_app', 'aws_subnet.private_db',
+                           'aws_route_table.public', 'aws_route_table_association.public',
+                           'aws_route_table.private_db', 'aws_route_table_association.private_db'],
+    '03-security-groups': ['aws_security_group.alb', 'aws_security_group.ecs', 'aws_security_group.rds',
+                           'aws_vpc_security_group_ingress_rule.alb_http',
+                           'aws_vpc_security_group_ingress_rule.alb_https',
+                           'aws_vpc_security_group_egress_rule.alb_to_ecs',
+                           'aws_vpc_security_group_ingress_rule.ecs_from_alb',
+                           'aws_vpc_security_group_egress_rule.ecs_all_outbound',
+                           'aws_vpc_security_group_ingress_rule.rds_from_ecs'],
+    '04-iam-roles'      : ['aws_iam_role.ecs_task_execution', 'aws_iam_role_policy_attachment.ecs_task_execution_managed',
+                           'aws_iam_role.ecs_task'],
+    '05-ecr'            : ['aws_ecr_repository.app', 'aws_ecr_lifecycle_policy.app'],
+    '07-secrets'        : ['random_password.db', 'aws_secretsmanager_secret.db', 'aws_secretsmanager_secret_version.db',
+                           'aws_iam_role_policy.ecs_task_execution_secrets'],
+    '08-cloudwatch-logs': ['aws_cloudwatch_log_group.app'],
+    '09-rds'            : ['aws_db_subnet_group.main', 'aws_db_instance.mysql'],
+    '10-nat-gateway'    : ['aws_eip.nat', 'aws_nat_gateway.main',
+                           'aws_route_table.private_app', 'aws_route_table_association.private_app'],
+    '11-load-balancer'  : ['aws_lb.app', 'aws_lb_target_group.app', 'aws_lb_listener.http'],
+    '12-ecs'            : ['aws_ecs_cluster.main', 'aws_ecs_task_definition.app', 'aws_ecs_service.app'],
+]
+
+// Runs the closure with the AWS keys from the Jenkins credential as environment variables.
+// Jenkins masks both values (****) if they ever appear in the log.
+def withAws(Closure body) {
+    withCredentials([usernamePassword(credentialsId: env.RUN_CREDENTIALS_ID,
+                                      usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                      passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+        body()
+    }
+}
+
+// PAUSES the build until a person clicks the approval button (at most 60 minutes) and
+// returns what the person typed (only used by destroy-all). The buttons appear as small
+// links at the very end of the console log, which is easy to miss in a long Terraform plan,
+// so this prints a banner with a direct link to the approval page first.
+def askApproval(String question, String okLabel, List fields = []) {
+    echo """
+==========================================================================
+ ACTION NEEDED: the build is now PAUSED and waits for you.
+   ${question}
+ 1. Read the plan above.
+ 2. Open ${env.BUILD_URL}input/
+    (or click "${okLabel}" at the very end of this Console Output)
+ 3. Click "${okLabel}" to continue, or "Abort" to cancel.
+ Nothing has been changed in AWS yet. Without a click within 60 minutes
+ the build stops as ABORTED and nothing is changed.
+=========================================================================="""
+    try {
+        def answer = timeout(time: 60, unit: 'MINUTES') {
+            input(id: 'Approve', message: question, ok: okLabel, parameters: fields)
+        }
+        return answer
+    } catch (err) {
+        echo 'NOT APPROVED: "Abort" was clicked, or nobody clicked within 60 minutes. ' +
+             'Nothing was changed in AWS. Run the same STEP again when you are ready.'
+        throw err   // keeps the build result ABORTED
+    }
+}
+
+// Shell function that runs the AWS CLI in its Docker image. Put at the top of an sh step.
+def AWS_FN = '''
+aws() { docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION "$AWS_CLI_IMAGE" "$@"; }
+'''
+
+// Shell function that runs Maven in its Docker image, inside product-app/ of this build's
+// workspace. Put at the top of an sh step, like AWS_FN.
+//   --volumes-from  the Maven container sees Jenkins' home folder (workspace, Maven cache)
+//                   and the Docker socket at exactly the same paths as Jenkins itself.
+//   --user          runs as the jenkins user, so Jenkins can delete the files it creates.
+//   --group-add     the group that owns the Docker socket: the integration test needs it,
+//                   because Testcontainers starts a MySQL container next to this one.
+//   TESTCONTAINERS_HOST_OVERRIDE  where this container reaches the ports of that MySQL
+//                   container. On Docker Desktop that is host.docker.internal; Testcontainers'
+//                   own guess (172.17.0.1) fails with "Could not connect to Ryuk".
+//   HOME=/tmp       the jenkins user has no home folder inside the Maven image.
+//   -e SONAR_TOKEN  passes the token only if it is set (withCredentials), never on a command line.
+def MAVEN_FN = '''
+mvn() {
+    docker run --rm --volumes-from "$(hostname)" -w "$WORKSPACE/product-app" \
+      --user "$(id -u):$(id -g)" --group-add "$(stat -c %g /var/run/docker.sock)" \
+      -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal \
+      -e HOME=/tmp -e MAVEN_CONFIG=/tmp/.m2 -e SONAR_TOKEN \
+      "$MAVEN_IMAGE" mvn -B -ntp -Duser.home=/tmp \
+        -Dmaven.repo.local="$MAVEN_REPO" -Dsonar.userHome="$SONAR_USER_HOME" "$@"
+}
+'''
+
+pipeline {
+    // The Jenkins container itself (it has the Docker CLI). Terraform stages switch to
+    // the Terraform image with their own "agent" line and reuse the same workspace.
+    agent any
+
+    parameters {
+        choice(name: 'STEP', description: 'Run ONE step at a time, in this order.', choices: [
+            '00-preflight',        // read-only: who am I, which AWS permissions do I have?
+            '01-state-bucket',     // S3 bucket for the Terraform state (terraform/bootstrap)
+            '02-network',          // VPC, 6 subnets, internet gateway, route tables
+            '03-security-groups',  // firewall chain ALB -> ECS -> RDS
+            '04-iam-roles',        // ECS task execution role + task role
+            '05-ecr',              // Docker image repository
+            '06-push-image',       // build the product-app image and push it to ECR
+            '07-secrets',          // DB password in Secrets Manager (+ read access for ECS)
+            '08-cloudwatch-logs',  // log group for the container logs
+            '09-rds',              // MySQL database (5-10 minutes)
+            '10-nat-gateway',      // outbound internet for the private subnets (costs money every hour)
+            '11-load-balancer',    // public ALB, target group, HTTP listener
+            '12-ecs',              // ECS cluster, task definition, service -> the app starts
+            '13-verify',           // read-only: nothing missing? API works through the ALB?
+            'code-quality',        // no AWS: tests + JaCoCo coverage + SonarQube Quality Gate (ACTION is ignored)
+            'destroy-all',         // delete everything except the state bucket
+        ])
+        choice(name: 'ACTION', choices: ['plan', 'apply'],
+               description: 'plan = only show what would change. apply = plan, wait for approval, then change AWS.')
+        string(name: 'AWS_CREDENTIALS_ID', defaultValue: 'aws-mani-dev',
+               description: 'Jenkins credential (Username with password = access key ID / secret access key) of the IAM user.')
+        string(name: 'IMAGE_TAG', defaultValue: 'latest',
+               description: 'Docker image tag pushed in step 06 and used by ECS (Terraform variable image_tag).')
+        string(name: 'PROJECT_DIR', defaultValue: '/run/desktop/mnt/host/d/Drive E/nibe/aws-dev',
+               description: 'The project folder on your PC as Docker Desktop sees it (D:\\Drive E\\nibe\\aws-dev).')
+        string(name: 'SONAR_HOST_URL', defaultValue: 'http://host.docker.internal:9000',
+               description: 'SonarQube for code-quality and step 06. host.docker.internal = your PC as seen from a container, so this is the SonarQube of the sonarqube/ folder (http://localhost:9000 in your browser).')
+        string(name: 'SONAR_CREDENTIALS_ID', defaultValue: 'sonar-token',
+               description: 'Jenkins credential (Secret text) holding a SonarQube analysis token. Create it with: ./scripts/jenkins-setup.sh --sonar-token')
+    }
+
+    environment {
+        AWS_REGION          = 'ap-south-1'   // must match aws_region in terraform/variables.tf
+        AWS_CLI_IMAGE       = 'amazon/aws-cli:2.36.24'
+        TF_IN_AUTOMATION    = 'true'         // shorter Terraform output, no "run terraform apply next" hints
+        TF_INPUT            = 'false'        // never wait for keyboard input
+        TF_PLUGIN_CACHE_DIR = '/var/jenkins_home/.terraform-plugin-cache'   // download the AWS provider only once
+        BOOTSTRAP_STATE     = '/var/jenkins_home/terraform-state/product-app/bootstrap.tfstate'
+        MAVEN_IMAGE         = 'maven:3.9.16-eclipse-temurin-25-alpine'   // same Java 25 as the Dockerfile's build stage
+        MAVEN_REPO          = '/var/jenkins_home/.m2/repository'         // download Maven dependencies only once
+        SONAR_USER_HOME     = '/var/jenkins_home/.sonar'                 // download the Sonar scanner only once
+        // TF_VAR_image_tag is set in the first stage, from RUN_IMAGE_TAG
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()   // never two Terraform runs at the same time
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+    }
+
+    stages {
+
+        stage('Get project files') {
+            steps {
+                script {
+                    // Copy every parameter into a RUN_* variable that falls back to the default value.
+                    // WHY: Jenkins learns the parameters of a new job only WHILE its very first build
+                    // runs, so that first build starts without them: params.X is null and $X does not
+                    // exist in sh steps. Build #1 failed exactly like that ("-v :/src:ro": empty PROJECT_DIR).
+                    // Every later stage reads the RUN_* copies, never params.X directly.
+                    env.RUN_STEP           = params.STEP ?: '00-preflight'
+                    env.RUN_ACTION         = params.ACTION ?: 'plan'
+                    env.RUN_CREDENTIALS_ID = params.AWS_CREDENTIALS_ID ?: 'aws-mani-dev'
+                    env.RUN_IMAGE_TAG      = params.IMAGE_TAG ?: 'latest'
+                    env.RUN_PROJECT_DIR    = params.PROJECT_DIR ?: '/run/desktop/mnt/host/d/Drive E/nibe/aws-dev'
+                    env.RUN_SONAR_HOST_URL = params.SONAR_HOST_URL ?: 'http://host.docker.internal:9000'
+                    env.RUN_SONAR_CREDENTIALS_ID = params.SONAR_CREDENTIALS_ID ?: 'sonar-token'
+                    env.TF_VAR_image_tag   = env.RUN_IMAGE_TAG   // Terraform variable image_tag (ECS task definition)
+                    if (!params.STEP) {
+                        echo 'First build of this job: no parameters yet, so it runs 00-preflight / plan. Use "Build with Parameters" from now on.'
+                    }
+
+                    if (env.RUN_STEP == 'destroy-all' && env.RUN_ACTION != 'apply') {
+                        echo 'destroy-all with ACTION=plan only lists what WOULD be deleted.'
+                    }
+                    env.STEP_KIND = [
+                        '00-preflight': 'preflight', '06-push-image': 'image',
+                        '13-verify': 'verify', 'code-quality': 'quality', 'destroy-all': 'destroy'
+                    ].get(env.RUN_STEP, 'terraform')
+                    env.TF_DIR = (env.RUN_STEP == '01-state-bucket') ? 'terraform/bootstrap' : 'terraform'
+                    env.TF_TARGET_ARGS = (STEP_TARGETS[env.RUN_STEP] ?: []).collect { "-target=${it}" }.join(' ')
+                    currentBuild.description = "${env.RUN_STEP} / ${env.RUN_ACTION}"
+                }
+                // Copy the project from your PC into this build's workspace.
+                // A team would use "checkout scm" from Git here; this project is not in Git yet.
+                sh '''
+                    find . -mindepth 1 -delete      # start from an empty workspace
+                    mkdir -p "$TF_PLUGIN_CACHE_DIR" "$(dirname "$BOOTSTRAP_STATE")"
+                    # Stop with a clear message instead of Docker's "invalid spec: :/src:ro"
+                    [ -n "$RUN_PROJECT_DIR" ] || { echo "ERROR: PROJECT_DIR is empty"; exit 1; }
+                    docker run --rm --user "$(id -u):$(id -g)" --volumes-from "$(hostname)" \
+                      -v "$RUN_PROJECT_DIR:/src:ro" -e DEST="$WORKSPACE" alpine:3.22 \
+                      sh -c 'cd /src && tar -cf - --exclude=.terraform --exclude="*.tfstate*" --exclude=tfplan \
+                               --exclude=target --exclude=.env --exclude=.vscode --exclude=backend.hcl . \
+                             | tar -xf - -C "$DEST"'
+                    echo "Project files in the workspace:"; ls -1
+                '''
+            }
+        }
+
+        stage('Who am I in AWS') {
+            when { not { environment name: 'STEP_KIND', value: 'quality' } }   // code-quality needs no AWS
+            steps {
+                script {
+                    withAws {
+                        sh AWS_FN + 'aws sts get-caller-identity --output table'
+                        env.AWS_ACCOUNT_ID = sh(returnStdout: true,
+                            script: AWS_FN + 'aws sts get-caller-identity --query Account --output text').trim()
+                    }
+                    // The state bucket name must be unique in the whole world, so it contains the account ID
+                    env.STATE_BUCKET = "product-app-tfstate-${env.AWS_ACCOUNT_ID}"
+                    env.TF_VAR_state_bucket_name = env.STATE_BUCKET   // used by terraform/bootstrap only
+                    env.ECR_REPO = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/product-app"
+                    echo "Region: ${env.AWS_REGION} | state bucket: ${env.STATE_BUCKET}"
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- step 00
+        stage('Preflight: AWS permissions') {
+            when { environment name: 'STEP_KIND', value: 'preflight' }
+            steps {
+                script {
+                    withAws {
+                        sh AWS_FN + '''
+                            FAILED=0
+                            # check <label> <aws arguments...>: OK if the call works, DENIED if AWS refuses it.
+                            # "Not found" answers also count as OK: AWS checked the permission first.
+                            check() {
+                                label=$1; shift
+                                if out=$(aws "$@" 2>&1) || echo "$out" | grep -qE 'NoSuchEntity|DryRunOperation'; then
+                                    printf 'OK      %s\\n' "$label"
+                                else
+                                    printf 'DENIED  %s  (%s)\\n' "$label" "$(echo "$out" | grep -oE 'AccessDenied[A-Za-z]*|UnauthorizedOperation|InvalidClientTokenId|[A-Za-z]+Exception' | head -1)"
+                                    FAILED=1
+                                fi
+                            }
+                            echo "Permission check for region $AWS_REGION:"
+                            check "EC2/VPC: read"                ec2 describe-vpcs --max-items 1
+                            check "EC2/VPC: create (dry run)"    ec2 create-vpc --cidr-block 10.99.0.0/16 --dry-run
+                            check "Elastic Load Balancing"       elbv2 describe-load-balancers --page-size 1
+                            check "ECS"                          ecs list-clusters
+                            check "ECR"                          ecr describe-repositories
+                            check "RDS"                          rds describe-db-instances --max-items 1
+                            check "Secrets Manager"              secretsmanager list-secrets --max-results 1
+                            check "CloudWatch Logs"              logs describe-log-groups --limit 1
+                            check "Application Auto Scaling"     application-autoscaling describe-scalable-targets --service-namespace ecs
+                            check "IAM: product-app roles"       iam get-role --role-name product-app-dev-ecs-task-role
+                            echo "S3 (state bucket) cannot be tested before the bucket exists; step 01 will show it."
+                            if [ $FAILED -ne 0 ]; then
+                                echo "Some permissions are missing. Attach terraform/deployer-iam-policy.json to the IAM user (docs/08, step 0)."
+                                exit 1
+                            fi
+                            echo "All permissions needed by the next steps are present."
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------- steps 01-12 and destroy-all
+        stage('Terraform plan') {
+            when { beforeAgent true; anyOf { environment name: 'STEP_KIND', value: 'terraform'; environment name: 'STEP_KIND', value: 'destroy' } }
+            agent { docker { image 'hashicorp/terraform:1.17.0'; args '--entrypoint='; reuseNode true } }
+            steps {
+                script {
+                    withAws {
+                        sh '''
+                            if [ "$TF_DIR" = terraform/bootstrap ]; then
+                                # The bucket cannot hold its own state, so this state file stays in Jenkins' home folder
+                                terraform -chdir="$TF_DIR" init -no-color -backend-config="path=$BOOTSTRAP_STATE"
+                            else
+                                # Remote state in the S3 bucket from step 01, locked with an S3 lockfile while we run
+                                terraform -chdir="$TF_DIR" init -no-color \
+                                  -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+                            fi
+                            terraform -chdir="$TF_DIR" validate -no-color
+                        '''
+                        if (env.STEP_KIND == 'destroy') {
+                            sh 'terraform -chdir="$TF_DIR" plan -no-color -destroy -out=tfplan'
+                        } else {
+                            echo "Targets of ${env.RUN_STEP}: ${env.TF_TARGET_ARGS ?: '(whole configuration)'}"
+                            sh 'terraform -chdir="$TF_DIR" plan -no-color -out=tfplan $TF_TARGET_ARGS'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Approve') {
+            when {
+                beforeAgent true
+                allOf {
+                    expression { env.RUN_ACTION == 'apply' }
+                    anyOf { environment name: 'STEP_KIND', value: 'terraform'; environment name: 'STEP_KIND', value: 'destroy' }
+                }
+            }
+            steps {
+                script {
+                    if (env.STEP_KIND == 'destroy') {
+                        def typed = askApproval('DELETE every resource shown in the plan above?', 'Destroy',
+                                                [string(name: 'CONFIRM', defaultValue: '',
+                                                        description: 'Type the word destroy to confirm')])
+                        if (typed != 'destroy') { error('Not confirmed: nothing was destroyed.') }
+                    } else {
+                        askApproval("Step ${env.RUN_STEP}: create/change the resources shown in the plan above?", 'Yes, apply')
+                    }
+                }
+            }
+        }
+
+        stage('Terraform apply') {
+            when {
+                beforeAgent true
+                allOf {
+                    expression { env.RUN_ACTION == 'apply' }
+                    anyOf { environment name: 'STEP_KIND', value: 'terraform'; environment name: 'STEP_KIND', value: 'destroy' }
+                }
+            }
+            agent { docker { image 'hashicorp/terraform:1.17.0'; args '--entrypoint='; reuseNode true } }
+            steps {
+                script {
+                    withAws {
+                        sh '''
+                            # Applies exactly the saved plan you approved, nothing else
+                            terraform -chdir="$TF_DIR" apply -no-color tfplan
+                            echo "----- Everything Terraform manages in this state so far -----"
+                            terraform -chdir="$TF_DIR" state list
+                            echo "----- Outputs available so far -----"
+                            terraform -chdir="$TF_DIR" output -no-color || true
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Wait for the ECS service') {
+            when { beforeAgent true; allOf { expression { env.RUN_ACTION == 'apply' && env.RUN_STEP == '12-ecs' } } }
+            steps {
+                script {
+                    withAws {
+                        sh AWS_FN + '''
+                            echo "Waiting until the ECS service is stable (task running and healthy in the ALB, max 10 min)..."
+                            aws ecs wait services-stable --cluster product-app-dev-cluster --services product-app-dev-service
+                            aws ecs describe-services --cluster product-app-dev-cluster --services product-app-dev-service \
+                              --query 'services[0].{status:status,desired:desiredCount,running:runningCount,rollout:deployments[0].rolloutState}' \
+                              --output table
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------- code-quality, and step 06 before the build
+        stage('Tests + JaCoCo coverage') {
+            when { anyOf { environment name: 'STEP_KIND', value: 'quality'; environment name: 'STEP_KIND', value: 'image' } }
+            steps {
+                script {
+                    // Same command as on your PC (docs/13). "verify" runs all tests (the integration test
+                    // starts MySQL with Testcontainers), writes the JaCoCo report, and FAILS this stage when
+                    // line coverage is below the 80 % minimum in pom.xml.
+                    sh MAVEN_FN + 'mvn clean verify'
+                }
+            }
+            post {
+                always {   // also after a failed test, so you can see which one failed
+                    junit allowEmptyResults: true, testResults: 'product-app/target/surefire-reports/*.xml'
+                    script {
+                        if (fileExists('product-app/target/site/jacoco/jacoco.xml')) {
+                            // Coverage chart on the job page and coloured source code ("JaCoCo coverage" link)
+                            recordCoverage(id: 'jacoco', name: 'JaCoCo coverage',
+                                           tools: [[parser: 'JACOCO', pattern: 'product-app/target/site/jacoco/jacoco.xml']],
+                                           sourceDirectories: [[path: 'product-app/src/main/java']])
+                            // The same HTML report you open locally ("JaCoCo report" link on the build page)
+                            publishHTML(target: [reportName: 'JaCoCo report', reportDir: 'product-app/target/site/jacoco',
+                                                 reportFiles: 'index.html', keepAll: true,
+                                                 alwaysLinkToLastBuild: true, allowMissing: false])
+                        } else {
+                            echo 'No JaCoCo report: Maven stopped before the tests finished (see the log above).'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube analysis + Quality Gate') {
+            when { anyOf { environment name: 'STEP_KIND', value: 'quality'; environment name: 'STEP_KIND', value: 'image' } }
+            steps {
+                // Stop early with a clear message when SonarQube is not running
+                sh '''
+                    if ! status=$(curl -fsS --max-time 10 "$RUN_SONAR_HOST_URL/api/system/status"); then
+                        echo "ERROR: SonarQube is not reachable at $RUN_SONAR_HOST_URL."
+                        echo "Start it on your PC:  cd sonarqube; docker compose up -d --wait"
+                        exit 1
+                    fi
+                    echo "SonarQube: $status"
+                '''
+                script {
+                    withCredentials([string(credentialsId: env.RUN_SONAR_CREDENTIALS_ID, variable: 'SONAR_TOKEN')]) {
+                        // Sends the code, the test results and jacoco.xml from the stage above (nothing is
+                        // re-run). sonar.qualitygate.wait=true in pom.xml makes Maven wait for SonarQube's
+                        // verdict: this stage FAILS when the Quality Gate is red. The token is masked (****).
+                        sh MAVEN_FN + 'mvn sonar:sonar -Dsonar.host.url="$RUN_SONAR_HOST_URL"'
+                    }
+                    // host.docker.internal is how containers see your PC; in your browser it is localhost
+                    echo "SonarQube dashboard: ${env.RUN_SONAR_HOST_URL.replace('host.docker.internal', 'localhost')}/dashboard?id=product-app"
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- step 06
+        stage('Build image') {
+            when { environment name: 'STEP_KIND', value: 'image' }
+            steps {
+                script {
+                    withAws {
+                        // The repository must exist (step 05) before we can push to it
+                        sh AWS_FN + 'aws ecr describe-repositories --repository-names product-app --query "repositories[0].repositoryUri" --output text'
+                    }
+                }
+                sh '''
+                    # Same Dockerfile as Docker Compose. ECS Fargate runs x86_64 (see ecs.tf), so build for linux/amd64.
+                    docker build --platform linux/amd64 -t "$ECR_REPO:$RUN_IMAGE_TAG" product-app
+                    docker image ls "$ECR_REPO"
+                '''
+            }
+        }
+
+        stage('Approve push') {
+            when { beforeAgent true; allOf { environment name: 'STEP_KIND', value: 'image'; expression { env.RUN_ACTION == 'apply' } } }
+            steps {
+                script {
+                    askApproval("Push ${env.ECR_REPO}:${env.RUN_IMAGE_TAG} to ECR?", 'Yes, push')
+                }
+            }
+        }
+
+        stage('Push image to ECR') {
+            when { beforeAgent true; allOf { environment name: 'STEP_KIND', value: 'image'; expression { env.RUN_ACTION == 'apply' } } }
+            steps {
+                script {
+                    withAws {
+                        sh AWS_FN + '''
+                            # Log in to ECR with a 12-hour token. The login is stored in the workspace and deleted below.
+                            export DOCKER_CONFIG="$WORKSPACE/.docker"
+                            aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPO%%/*}"
+                            docker push "$ECR_REPO:$RUN_IMAGE_TAG"
+                            docker logout "${ECR_REPO%%/*}"; rm -rf "$DOCKER_CONFIG"
+                            echo "Images now in the ECR repository (tag, pushed at, size in bytes):"
+                            aws ecr describe-images --repository-name product-app \
+                              --query 'imageDetails[].[imageTags[0],imagePushedAt,imageSizeInBytes]' --output table
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- step 13
+        stage('Verify: nothing missing') {
+            when { beforeAgent true; environment name: 'STEP_KIND', value: 'verify' }
+            agent { docker { image 'hashicorp/terraform:1.17.0'; args '--entrypoint='; reuseNode true } }
+            steps {
+                script {
+                    withAws {
+                        sh '''
+                            terraform -chdir=terraform init -no-color \
+                              -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+                        '''
+                        // Exit code 0 = AWS matches the code exactly, 2 = something is missing or different
+                        def rc = sh(returnStatus: true, script: 'terraform -chdir=terraform plan -no-color -detailed-exitcode')
+                        if (rc == 2) { error('The full plan is not empty: a resource is missing or was changed outside Terraform (see above).') }
+                        if (rc != 0) { error('terraform plan failed (see above).') }
+                        echo 'Full plan: No changes. Every resource in the code exists in AWS.'
+                        sh 'terraform -chdir=terraform output -no-color'
+                        env.APP_URL = sh(returnStdout: true, script: 'terraform -chdir=terraform output -raw app_url').trim()
+                    }
+                }
+            }
+        }
+
+        stage('Verify: API through the ALB') {
+            when { environment name: 'STEP_KIND', value: 'verify' }
+            steps {
+                script {
+                    withAws {
+                        sh AWS_FN + '''
+                            TG_ARN=$(aws elbv2 describe-target-groups --names product-app-dev-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+                            echo "Target health (must be healthy):"
+                            aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+                              --query 'TargetHealthDescriptions[].{target:Target.Id,port:Target.Port,state:TargetHealth.State}' --output table
+                            echo "Last application log lines from CloudWatch:"
+                            aws logs tail /ecs/product-app-dev --since 60m | tail -n 20
+                        '''
+                    }
+                }
+                sh 'bash scripts/smoke-test.sh "$APP_URL"'
+            }
+        }
+    }
+
+    post {
+        always {
+            // The workspace holds the saved plan, which can contain the generated DB password: delete it.
+            deleteDir()
+        }
+    }
+}

@@ -1,0 +1,4 @@
+# Copy to backend.hcl and fill in the bucket created by ./bootstrap.
+# Usage: terraform init -backend-config=backend.hcl
+bucket = "product-app-tfstate-123456789012"
+region = "ap-south-1"

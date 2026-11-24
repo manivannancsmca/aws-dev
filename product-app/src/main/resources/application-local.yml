@@ -1,0 +1,15 @@
+# ---------------------------------------------------------------------------
+# "local" profile: used by Docker Compose on your machine.
+# Activated with SPRING_PROFILES_ACTIVE=local
+# ---------------------------------------------------------------------------
+management:
+  endpoint:
+    health:
+      # Show the database status inside /actuator/health (handy while developing)
+      show-details: always
+
+logging:
+  level:
+    com.example.productapp: DEBUG
+    # Print the SQL that Hibernate executes
+    org.hibernate.SQL: DEBUG

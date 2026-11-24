@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars to override the defaults from variables.tf.
+# Only values that differ from the defaults need to be listed.
+
+aws_region         = "ap-south-1"
+availability_zones = ["ap-south-1a", "ap-south-1b"]
+environment        = "dev"
+
+# Image tag to deploy (must exist in ECR). "latest" is simplest while learning.
+image_tag = "latest"
+
+# --- Optional HTTPS. Leave empty for HTTP only. ---
+# Option A: an existing, already validated ACM certificate in the same region
+# certificate_arn = "arn:aws:acm:ap-south-1:123456789012:certificate/..."
+# Option B: let Terraform create + DNS-validate a certificate (needs a Route 53 hosted zone)
+# domain_name      = "products.example.com"
+# route53_zone_id  = "Z0123456789ABCDEFGHIJ"
+
+# --- Scaling (see docs/09-scaling-and-cost.md) ---
+# enable_autoscaling = true
+# db_multi_az        = true

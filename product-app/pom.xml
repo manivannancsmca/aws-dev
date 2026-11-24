@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Spring Boot parent: manages dependency versions, plugin versions and Java compiler settings -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.2.0</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.example</groupId>
+  <artifactId>product-app</artifactId>
+  <version>1.0.0</version>
+  <name>product-app</name>
+  <description>Product management REST API (Spring Boot, MySQL, Flyway, Swagger)</description>
+
+  <properties>
+    <!-- Java 25 (LTS). Spring Boot turns this into the compiler's "release" setting:
+         the code is compiled for Java 25, so building it needs JDK 25 or newer. -->
+    <java.version>25</java.version>
+    <springdoc.version>3.2.1</springdoc.version>
+
+    <!-- ===== Code quality: JaCoCo (test coverage) + SonarQube (code analysis) ===== -->
+    <!-- Spring Boot does not manage these two plugins, so we pin their versions here -->
+    <jacoco.version>0.8.16</jacoco.version>
+    <sonar-maven-plugin.version>5.9.0.7382</sonar-maven-plugin.version>
+
+    <!-- Minimum line coverage checked by "mvn verify". Below it the build FAILS (0.80 = 80 %). -->
+    <jacoco.minimum.line.coverage>0.80</jacoco.minimum.line.coverage>
+
+    <!-- Extra options for the JVM that runs the tests. Empty on purpose: JaCoCo's prepare-agent adds
+         its agent here, and the surefire plugin below adds Mockito's. Keeping it defined means
+         "@{argLine}" still works when JaCoCo is skipped (mvn test -Djacoco.skip=true). -->
+    <argLine></argLine>
+
+    <!-- SonarQube settings, read by "mvn sonar:sonar". Each one can be overridden on the command
+         line, e.g. -Dsonar.host.url=https://sonar.mycompany.com in a CI pipeline.
+         The login token is NOT stored here: the scanner reads it from the SONAR_TOKEN environment variable. -->
+    <sonar.host.url>http://localhost:9000</sonar.host.url>
+    <sonar.projectKey>product-app</sonar.projectKey>
+    <!-- The XML report written by JaCoCo; SonarQube imports the coverage numbers from it -->
+    <sonar.coverage.jacoco.xmlReportPaths>${project.build.directory}/site/jacoco/jacoco.xml</sonar.coverage.jacoco.xmlReportPaths>
+    <!-- Same exclusion as in the JaCoCo plugin below, so both tools show the same coverage -->
+    <sonar.coverage.exclusions>**/ProductAppApplication.java</sonar.coverage.exclusions>
+    <!-- Wait for the Quality Gate result and FAIL the Maven build if the gate fails -->
+    <sonar.qualitygate.wait>true</sonar.qualitygate.wait>
+  </properties>
+
+  <dependencies>
+    <!-- REST controllers, embedded Tomcat, JSON (Jackson) -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-webmvc</artifactId>
+    </dependency>
+
+    <!-- Spring Data JPA + Hibernate for database access -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+
+    <!-- Bean Validation (@NotBlank, @Min, ...) for request DTOs -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+
+    <!-- Actuator: /actuator/health used by Docker, ECS and the load balancer -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <!-- Flyway: versioned SQL migrations run automatically on startup -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-flyway</artifactId>
+    </dependency>
+    <!-- Flyway database-specific support module (required for MySQL since Flyway 10) -->
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-mysql</artifactId>
+    </dependency>
+
+    <!-- MySQL JDBC driver (only needed at runtime) -->
+    <dependency>
+      <groupId>com.mysql</groupId>
+      <artifactId>mysql-connector-j</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
+    <!-- Swagger UI + OpenAPI 3 documentation generated from the controllers -->
+    <dependency>
+      <groupId>org.springdoc</groupId>
+      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+      <version>${springdoc.version}</version>
+    </dependency>
+
+    <!-- ===== Test dependencies ===== -->
+    <!-- JUnit 5, AssertJ, Mockito, Spring Test -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- @WebMvcTest / MockMvc for controller slice tests -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-webmvc-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- Testcontainers: starts a real MySQL in Docker for the integration test -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-mysql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <!-- Produces target/product-app.jar (no version suffix) so the Dockerfile stays simple -->
+    <finalName>product-app</finalName>
+
+    <pluginManagement>
+      <plugins>
+        <!-- SonarQube scanner for Maven. It is not bound to any build phase: it runs only when you
+             type "mvn sonar:sonar". Declaring it here pins the version and lets Maven find the "sonar:" prefix. -->
+        <plugin>
+          <groupId>org.sonarsource.scanner.maven</groupId>
+          <artifactId>sonar-maven-plugin</artifactId>
+          <version>${sonar-maven-plugin.version}</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+
+      <!-- JaCoCo measures which lines and branches your tests execute. Three steps:
+           1. prepare-agent  before the tests: attaches the JaCoCo agent to the test JVM (writes target/jacoco.exec)
+           2. report         after the tests:  target/site/jacoco/index.html (for you) + jacoco.xml (for SonarQube)
+           3. check          in "mvn verify":  fails the build if line coverage < jacoco.minimum.line.coverage -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>${jacoco.version}</version>
+        <executions>
+          <execution>
+            <id>prepare-agent</id>
+            <goals>
+              <goal>prepare-agent</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>report</id>
+            <!-- "test" instead of the default "verify", so a plain "mvn test" also writes the report -->
+            <phase>test</phase>
+            <goals>
+              <goal>report</goal>
+            </goals>
+            <configuration>
+              <excludes>
+                <!-- Only holds main() which starts Spring; there is nothing to test in it -->
+                <exclude>com/example/productapp/ProductAppApplication.class</exclude>
+              </excludes>
+            </configuration>
+          </execution>
+          <execution>
+            <id>check</id>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <configuration>
+              <!-- Same exclusion as the report, so the check uses the number you see in index.html -->
+              <excludes>
+                <exclude>com/example/productapp/ProductAppApplication.class</exclude>
+              </excludes>
+              <rules>
+                <rule>
+                  <!-- BUNDLE = the whole application (not per class or per package) -->
+                  <element>BUNDLE</element>
+                  <limits>
+                    <limit>
+                      <counter>LINE</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>${jacoco.minimum.line.coverage}</minimum>
+                    </limit>
+                  </limits>
+                </rule>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Mockito as a Java agent. Mockito needs an agent to mock classes. Without this setup it
+           attaches itself while the tests run, which prints "Mockito is currently self-attaching"
+           and "A Java agent has been loaded dynamically", and future JDKs will block it.
+           Here the agent is loaded when the test JVM starts instead. Two steps:
+           1. dependency:properties  creates one property per dependency that holds its jar path,
+                                     e.g. ${org.mockito:mockito-core:jar}
+           2. surefire               starts the test JVM with -javaagent:<that jar>.
+                                     "@{argLine}" (with @, filled in late) keeps the JaCoCo agent
+                                     that prepare-agent put into the argLine property. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>dependency-jar-paths</id>
+            <goals>
+              <goal>properties</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!-- Quotes keep it working when the jar path contains a space (e.g. C:\Users\First Last\.m2) -->
+          <argLine>@{argLine} "-javaagent:${org.mockito:mockito-core:jar}"</argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
